@@ -3,14 +3,15 @@ add_rules("mode.debug", "mode.release")
 add_repositories("levimc-repo https://github.com/LiteLDev/xmake-repo.git")
 
 option("target_type")
-    set_default("server")
+    set_default("client")
     set_showmenu(true)
     set_values("server", "client")
 option_end()
 
--- add_requires("levilamina x.x.x") for a specific version
--- add_requires("levilamina develop") to use develop version
--- please note that you should add bdslibrary yourself if using dev version
+-- Versão do LeviLamina: sem número, o xmake pega a mais recente.
+-- Depois de ver no GitHub qual tag combina com seu jogo (26.52.x),
+-- troque pela linha fixada, por exemplo:
+-- add_requires("levilamina 26.52.0", {configs = {target_type = get_config("target_type")}})
 add_requires("levilamina", {configs = {target_type = get_config("target_type")}})
 
 add_requires("levibuildscript")
@@ -19,7 +20,7 @@ if not has_config("vs_runtime") then
     set_runtimes("MD")
 end
 
-target("my-mod") -- Change this to your mod name.
+target("meu-tracer") -- Nome do mod
     add_rules("@levibuildscript/linkrule")
     add_rules("@levibuildscript/modpacker")
     if is_plat("windows") then
@@ -52,6 +53,6 @@ target("my-mod") -- Change this to your mod name.
     --  add_includedirs("src-server")
     --  add_files("src-server/**.cpp")
     else
-    --  add_includedirs("src-client")
-    --  add_files("src-client/**.cpp")
+        add_includedirs("src-client")
+        add_files("src-client/**.cpp")
     end
