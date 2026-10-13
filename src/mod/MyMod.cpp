@@ -16,6 +16,7 @@
 #include "mc/client/player/LocalPlayer.h"
 #include "mc/deps/core/math/Color.h"
 #include "mc/deps/input/RectangleArea.h"
+#include "mc/deps/renderer/Camera.h"
 #include "mc/world/actor/player/Player.h"
 #include "mc/world/level/Level.h"
 

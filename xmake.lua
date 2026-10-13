@@ -8,7 +8,8 @@ option("target_type")
     set_values("server", "client")
 option_end()
 
-add_requires("levilamina", {configs = {target_type = get_config("target_type")}})
+-- Versão fixa para o build não mudar sozinho. O xmake resolveu 26.51.7.
+add_requires("levilamina 26.51.7", {configs = {target_type = get_config("target_type")}})
 
 add_requires("levibuildscript")
 
@@ -40,7 +41,7 @@ target("my-mod")
     end
     add_packages("levilamina")
     set_kind("shared")
-    set_languages("c++20")
+    set_languages("c++23")
     set_symbols("debug")
     add_headerfiles("src/**.h")
     add_files("src/**.cpp")
