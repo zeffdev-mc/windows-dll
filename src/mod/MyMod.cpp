@@ -5,7 +5,6 @@
 #include <cmath>
 #include <set>
 #include <string>
-#include <vector>
 
 #include "ll/api/event/EventBus.h"
 #include "ll/api/event/input/KeyInputEvent.h"
@@ -27,170 +26,166 @@ namespace my_mod {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Controles em jogo:
-//   R = liga/desliga o tracer
-//   T = troca o modo de projecao (0..4)  <- use ate a linha cair em cima do jogador
-//   Y = inverte vertical   U = inverte horizontal
+// Teclas em jogo:
+//   R      liga/desliga o tracer
+//   B      troca a origem da escala horizontal (aspecto da tela  <->  matriz P00)
+//   [  ]   diminui / aumenta a escala geral (5% por toque)
+//   ,  .   diminui / aumenta so a escala horizontal (5% por toque)
 // ---------------------------------------------------------------------------
 
-enum Mode { MatCol = 0, MatRow = 1, LookCamFov = 2, Look70 = 3, Basis = 4, ModeCount = 5 };
+constexpr int kKeyScaleDown  = 219; // [
+constexpr int kKeyScaleUp    = 221; // ]
+constexpr int kKeyScaleXDown = 188; // ,
+constexpr int kKeyScaleXUp   = 190; // .
 
-constexpr char const* kModeNames[ModeCount] = {
-    "0: matrizes view/proj (coluna)",
-    "1: matrizes view/proj (linha)",
-    "2: olhar do jogador + FOV da projecao",
-    "3: olhar do jogador + FOV 70",
-    "4: base da camera (versao antiga)"
-};
-
-bool  gActive         = false;
-bool  gTracerOn       = false;
-bool  gLogNextFrame   = false;
-int   gMode           = 0;
-float gFlipX          = 1.0f;
-float gFlipY          = 1.0f;
-bool  gSeenHud        = false;
-int   gPassesNoHud    = 0;
+bool  gActive       = false;
+bool  gTracerOn     = false;
+bool  gLogNextFrame = false;
+bool  gUseP00       = false; // false: escala X = P11 / aspecto da tela
+float gScale        = 1.0f;
+float gScaleX       = 1.0f;
+bool  gSeenHud      = false;
+int   gPassesNoHud  = 0;
 std::chrono::steady_clock::time_point gLastDraw{};
 
 struct Vec3f {
     float x, y, z;
 };
-struct Vec4f {
-    float x, y, z, w;
-};
-
-// glm guarda por coluna: m[coluna][linha].  r = m * v
-Vec4f mulColumn(glm::mat4 const& m, Vec4f v) {
-    return {
-        m[0][0] * v.x + m[1][0] * v.y + m[2][0] * v.z + m[3][0] * v.w,
-        m[0][1] * v.x + m[1][1] * v.y + m[2][1] * v.z + m[3][1] * v.w,
-        m[0][2] * v.x + m[1][2] * v.y + m[2][2] * v.z + m[3][2] * v.w,
-        m[0][3] * v.x + m[1][3] * v.y + m[2][3] * v.z + m[3][3] * v.w
-    };
-}
-
-// convencao de DirectX: vetor-linha.  r = v * m
-Vec4f mulRow(glm::mat4 const& m, Vec4f v) {
-    return {
-        v.x * m[0][0] + v.y * m[0][1] + v.z * m[0][2] + v.w * m[0][3],
-        v.x * m[1][0] + v.y * m[1][1] + v.z * m[1][2] + v.w * m[1][3],
-        v.x * m[2][0] + v.y * m[2][1] + v.z * m[2][2] + v.w * m[2][3],
-        v.x * m[3][0] + v.y * m[3][1] + v.z * m[3][2] + v.w * m[3][3]
-    };
-}
 
 float dot3(Vec3f a, Vec3f b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 
-Vec3f norm3(Vec3f a) {
-    float l = std::sqrt(dot3(a, a));
-    if (l < 1e-6f) {
-        return {0.0f, 0.0f, 0.0f};
+// Projeta um ponto do mundo para coordenadas da GUI. false = atras da camera.
+bool worldToScreen(ClientInstance& ci, Vec3f p, float guiW, float guiH, float& sx, float& sy) {
+    auto& cam = ci.getCamera();
+
+    Vec3f pos{cam.mPosition->x, cam.mPosition->y, cam.mPosition->z};
+    Vec3f fwd{cam.mForward->x, cam.mForward->y, cam.mForward->z};
+    Vec3f rgt{cam.mRight->x, cam.mRight->y, cam.mRight->z};
+    Vec3f up{cam.mUp->x, cam.mUp->y, cam.mUp->z};
+
+    Vec3f d{p.x - pos.x, p.y - pos.y, p.z - pos.z};
+    float z = dot3(d, fwd);
+    if (z < 0.05f) {
+        return false;
     }
-    return {a.x / l, a.y / l, a.z / l};
-}
+    float x = dot3(d, rgt);
+    float y = dot3(d, up);
 
-Vec3f cross3(Vec3f a, Vec3f b) {
-    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
-}
+    auto  proj   = cam.getProjectionMatrix();
+    float p00    = std::abs(proj[0][0]);
+    float p11    = std::abs(proj[1][1]);
+    float aspect = guiW / guiH;
 
-bool toScreenFromNdc(float ndcX, float ndcY, float guiW, float guiH, float& sx, float& sy) {
-    sx = (gFlipX * ndcX * 0.5f + 0.5f) * guiW;
-    sy = (0.5f - gFlipY * ndcY * 0.5f) * guiH;
+    float kx = gUseP00 ? p00 : p11 / aspect; // fator horizontal
+    float ky = p11;                          // fator vertical
+
+    float ndcX = gScale * gScaleX * x * kx / z;
+    float ndcY = gScale * y * ky / z;
+
+    sx = (ndcX * 0.5f + 0.5f) * guiW;
+    sy = (0.5f - ndcY * 0.5f) * guiH;
     return true;
 }
 
-// Projeta um ponto do mundo para coordenadas da GUI. false = atras da camera.
-bool worldToScreen(ClientInstance& ci, LocalPlayer& lp, Vec3f p, float guiW, float guiH, float& sx, float& sy) {
-    auto& cam = ci.getCamera();
+// Recorta o segmento no retangulo [0,W]x[0,H] (Liang-Barsky).
+bool clipLine(float& x0, float& y0, float& x1, float& y1, float W, float H) {
+    float dx = x1 - x0;
+    float dy = y1 - y0;
+    float t0 = 0.0f;
+    float t1 = 1.0f;
 
-    switch (gMode) {
-    case MatCol:
-    case MatRow: {
-        glm::mat4 view = *cam.viewMatrixStack->top()._m;
-        glm::mat4 proj = *cam.projectionMatrixStack->top()._m;
-        Vec4f     v{p.x, p.y, p.z, 1.0f};
-        Vec4f     clip;
-        if (gMode == MatCol) {
-            clip = mulColumn(proj, mulColumn(view, v));
+    auto clip = [&](float p, float q) {
+        if (std::abs(p) < 1e-9f) {
+            return q >= 0.0f;
+        }
+        float r = q / p;
+        if (p < 0.0f) {
+            if (r > t1) return false;
+            if (r > t0) t0 = r;
         } else {
-            clip = mulRow(proj, mulRow(view, v)); // (v * view) * proj
+            if (r < t0) return false;
+            if (r < t1) t1 = r;
         }
-        if (clip.w < 0.05f) {
-            return false;
-        }
-        return toScreenFromNdc(clip.x / clip.w, clip.y / clip.w, guiW, guiH, sx, sy);
-    }
-    case LookCamFov:
-    case Look70: {
-        Vec3 eyeV = lp.getEyePos();
-        Vec3 fV   = lp.getViewVector(1.0f);
-        Vec3f eye{eyeV.x, eyeV.y, eyeV.z};
-        Vec3f f = norm3({fV.x, fV.y, fV.z});
-        Vec3f right = norm3({-f.z, 0.0f, f.x});
-        Vec3f up    = cross3(right, f);
+        return true;
+    };
 
-        Vec3f d{p.x - eye.x, p.y - eye.y, p.z - eye.z};
-        float z = dot3(d, f);
-        if (z < 0.05f) {
-            return false;
-        }
-        float x = dot3(d, right);
-        float y = dot3(d, up);
-
-        float t = std::tan(70.0f * 3.14159265f / 180.0f * 0.5f); // modo 3: FOV 70
-        if (gMode == LookCamFov) {
-            float p11 = std::abs(cam.getProjectionMatrix()[1][1]); // = 1 / tan(fov/2)
-            if (p11 < 1e-4f) {
-                return false;
-            }
-            t = 1.0f / p11;
-        }
-        float aspect = guiW / guiH;
-        if (t < 1e-4f) {
-            return false;
-        }
-        return toScreenFromNdc(x / (z * t * aspect), y / (z * t), guiW, guiH, sx, sy);
-    }
-    default: { // Basis: versao antiga
-        Vec3f pos{cam.mPosition->x, cam.mPosition->y, cam.mPosition->z};
-        Vec3f fwd{cam.mForward->x, cam.mForward->y, cam.mForward->z};
-        Vec3f rgt{cam.mRight->x, cam.mRight->y, cam.mRight->z};
-        Vec3f up{cam.mUp->x, cam.mUp->y, cam.mUp->z};
-        Vec3f d{p.x - pos.x, p.y - pos.y, p.z - pos.z};
-        float z = dot3(d, fwd);
-        if (z < 0.05f) {
-            return false;
-        }
-        float x    = dot3(d, rgt);
-        float y    = dot3(d, up);
-        auto  proj = cam.getProjectionMatrix();
-        return toScreenFromNdc(x * std::abs(proj[0][0]) / z, y * std::abs(proj[1][1]) / z, guiW, guiH, sx, sy);
-    }
+    if (clip(-dx, x0) && clip(dx, W - x0) && clip(-dy, y0) && clip(dy, H - y0)) {
+        float nx1 = x0 + t1 * dx;
+        float ny1 = y0 + t1 * dy;
+        float nx0 = x0 + t0 * dx;
+        float ny0 = y0 + t0 * dy;
+        x0 = nx0; y0 = ny0; x1 = nx1; y1 = ny1;
+        return true;
     }
     return false;
 }
 
-// O desenhista de UI nao tem "linha": desenhamos uma fila de quadradinhos.
-void drawLine(MinecraftUIRenderContext& ctx, float x0, float y0, float x1, float y1, mce::Color const& color) {
-    float dx    = x1 - x0;
-    float dy    = y1 - y0;
-    float len   = std::sqrt(dx * dx + dy * dy);
-    int   steps = std::clamp(static_cast<int>(len / 1.5f), 1, 250);
-    constexpr float h = 0.75f;
+void fillRect(MinecraftUIRenderContext& ctx, float xa, float xb, float ya, float yb, mce::Color const& color) {
+    RectangleArea r;
+    r._x0 = xa;
+    r._x1 = xb;
+    r._y0 = ya;
+    r._y1 = yb;
+    ctx.fillRectangle(r, color, 1.0f);
+}
 
-    for (int i = 0; i <= steps; ++i) {
-        float t  = static_cast<float>(i) / static_cast<float>(steps);
-        float cx = x0 + dx * t;
-        float cy = y0 + dy * t;
-
-        RectangleArea r;
-        r._x0 = cx - h;
-        r._x1 = cx + h;
-        r._y0 = cy - h;
-        r._y1 = cy + h;
-        ctx.fillRectangle(r, color, 1.0f);
+// Linha fina de verdade: percorre o eixo maior em passos de 1 pixel fisico e junta os
+// passos que caem na mesma linha/coluna de pixels em um unico retangulo.
+// px = tamanho de 1 pixel fisico em unidades da GUI.
+void drawLine(
+    MinecraftUIRenderContext& ctx,
+    float x0, float y0, float x1, float y1,
+    float guiW, float guiH,
+    float px, float thickPx,
+    mce::Color const& color
+) {
+    if (!clipLine(x0, y0, x1, y1, guiW, guiH)) {
+        return;
     }
+
+    float dx         = x1 - x0;
+    float dy         = y1 - y0;
+    bool  horizontal = std::abs(dx) >= std::abs(dy);
+
+    float majorLen = horizontal ? std::abs(dx) : std::abs(dy);
+    int   n        = std::clamp(static_cast<int>(std::ceil(majorLen / px)), 1, 4000);
+    float thick    = thickPx * px;
+
+    auto snap = [&](float v) { return std::floor(v / px) * px; };
+
+    float runMinor = 0.0f;
+    float runStart = 0.0f;
+    float runEnd   = 0.0f;
+
+    auto emit = [&]() {
+        float a = std::min(runStart, runEnd);
+        float b = std::max(runStart, runEnd) + px;
+        if (horizontal) {
+            fillRect(ctx, a, b, runMinor, runMinor + thick, color);
+        } else {
+            fillRect(ctx, runMinor, runMinor + thick, a, b, color);
+        }
+    };
+
+    for (int i = 0; i <= n; ++i) {
+        float t     = static_cast<float>(i) / static_cast<float>(n);
+        float major = horizontal ? (x0 + dx * t) : (y0 + dy * t);
+        float minor = snap(horizontal ? (y0 + dy * t) : (x0 + dx * t));
+
+        if (i == 0) {
+            runMinor = minor;
+            runStart = major;
+            runEnd   = major;
+        } else if (minor == runMinor) {
+            runEnd = major;
+        } else {
+            emit();
+            runMinor = minor;
+            runStart = major;
+            runEnd   = major;
+        }
+    }
+    emit();
 }
 
 void drawTracers(MinecraftUIRenderContext& ctx) {
@@ -212,7 +207,14 @@ void drawTracers(MinecraftUIRenderContext& ctx) {
         return;
     }
 
-    Level& level = local->getLevel();
+    // Quantos pixels fisicos tem cada unidade da GUI.
+    float pxPerUnit = gui->mScreenSizeData->clientScreenSize->x / guiW;
+    if (pxPerUnit < 0.5f || pxPerUnit > 16.0f) {
+        pxPerUnit = 3.0f;
+    }
+    float px = 1.0f / pxPerUnit;
+
+    Level&     level = local->getLevel();
     mce::Color red(1.0f, 0.1f, 0.1f, 1.0f);
 
     float cx = guiW * 0.5f;
@@ -240,28 +242,26 @@ void drawTracers(MinecraftUIRenderContext& ctx) {
 
         float sx = 0.0f;
         float sy = 0.0f;
-        bool  ok = worldToScreen(ci, *local, torso, guiW, guiH, sx, sy);
+        bool  ok = worldToScreen(ci, torso, guiW, guiH, sx, sy);
         if (log) {
             if (ok) {
-                logger.info(
-                    "alvo {}: mundo ({:.1f},{:.1f},{:.1f}) -> tela ({:.1f},{:.1f}) de {:.0f}x{:.0f}",
-                    found, torso.x, torso.y, torso.z, sx, sy, guiW, guiH
-                );
+                logger.info("alvo {}: tela ({:.1f},{:.1f}) de {:.0f}x{:.0f}", found, sx, sy, guiW, guiH);
             } else {
                 logger.info("alvo {}: atras da camera", found);
             }
         }
         if (ok) {
-            drawLine(ctx, cx, cy, sx, sy, red);
+            drawLine(ctx, cx, cy, sx, sy, guiW, guiH, px, 2.0f, red);
         }
     }
 
     if (log) {
-        auto& cam = ci.getCamera();
+        auto  proj = ci.getCamera().getProjectionMatrix();
+        float p00  = proj[0][0];
+        float p11  = proj[1][1];
         logger.info(
-            "diagnostico: modo={} flipX={} flipY={} jogadores={} camPos=({:.1f},{:.1f},{:.1f}) P00={:.3f} P11={:.3f}",
-            kModeNames[gMode], gFlipX, gFlipY, found, cam.mPosition->x, cam.mPosition->y, cam.mPosition->z,
-            cam.getProjectionMatrix()[0][0], cam.getProjectionMatrix()[1][1]
+            "diagnostico: jogadores={} P00={:.3f} P11={:.3f} P11/P00={:.3f} aspecto_tela={:.3f} usaP00={} escala={:.2f} escalaX={:.2f} px/unidade={:.2f}",
+            found, p00, p11, p00 != 0.0f ? p11 / p00 : 0.0f, guiW / guiH, gUseP00, gScale, gScaleX, pxPerUnit
         );
         gLogNextFrame = false;
     }
@@ -280,7 +280,7 @@ bool MyMod::load() {
 }
 
 bool MyMod::enable() {
-    getSelf().getLogger().info("Meu Tracer: enable - R liga/desliga, T troca modo, Y/U invertem");
+    getSelf().getLogger().info("Meu Tracer: enable - R liga/desliga; B, [ ] , . calibram");
     gActive = true;
 
     auto& bus = ll::event::EventBus::getInstance();
@@ -308,20 +308,30 @@ bool MyMod::enable() {
             gLogNextFrame = gTracerOn;
             logger.info("Tracer {}", gTracerOn ? "LIGADO" : "DESLIGADO");
             break;
-        case 'T':
-            gMode         = (gMode + 1) % ModeCount;
+        case 'B':
+            gUseP00       = !gUseP00;
             gLogNextFrame = true;
-            logger.info("Modo de projecao {}", kModeNames[gMode]);
+            logger.info("Escala horizontal vem de: {}", gUseP00 ? "P00 (matriz)" : "P11 / aspecto da tela");
             break;
-        case 'Y':
-            gFlipY        = -gFlipY;
+        case kKeyScaleDown:
+            gScale        = std::max(0.2f, gScale * 0.95f);
             gLogNextFrame = true;
-            logger.info("Vertical invertido: {}", gFlipY < 0.0f ? "sim" : "nao");
+            logger.info("Escala geral = {:.3f}", gScale);
             break;
-        case 'U':
-            gFlipX        = -gFlipX;
+        case kKeyScaleUp:
+            gScale        = std::min(5.0f, gScale * 1.05f);
             gLogNextFrame = true;
-            logger.info("Horizontal invertido: {}", gFlipX < 0.0f ? "sim" : "nao");
+            logger.info("Escala geral = {:.3f}", gScale);
+            break;
+        case kKeyScaleXDown:
+            gScaleX       = std::max(0.2f, gScaleX * 0.95f);
+            gLogNextFrame = true;
+            logger.info("Escala horizontal = {:.3f}", gScaleX);
+            break;
+        case kKeyScaleXUp:
+            gScaleX       = std::min(5.0f, gScaleX * 1.05f);
+            gLogNextFrame = true;
+            logger.info("Escala horizontal = {:.3f}", gScaleX);
             break;
         default:
             break;
@@ -333,8 +343,7 @@ bool MyMod::enable() {
             return;
         }
 
-        // O evento dispara uma vez por tela. Desenhamos so na tela do HUD,
-        // senao a linha some e volta conforme outras telas pintam por cima.
+        // O evento dispara uma vez por tela. Desenhamos so na tela do HUD.
         std::string name = event.screenView().getScreenName();
 
         static std::set<std::string> seen;
@@ -350,7 +359,7 @@ bool MyMod::enable() {
         if (gSeenHud) {
             draw = isHud;
         } else if (++gPassesNoHud > 300) {
-            // Nao achamos nenhuma tela com "hud" no nome: desenha uma vez por quadro em qualquer tela.
+            // Nenhuma tela com "hud" no nome: desenha uma vez por quadro em qualquer tela.
             auto now = std::chrono::steady_clock::now();
             if (now - gLastDraw >= std::chrono::milliseconds(4)) {
                 gLastDraw = now;
