@@ -8,10 +8,6 @@ option("target_type")
     set_values("server", "client")
 option_end()
 
--- Versão do LeviLamina: sem número, o xmake pega a mais recente.
--- Depois de ver no GitHub qual tag combina com seu jogo (26.52.x),
--- troque pela linha fixada, por exemplo:
--- add_requires("levilamina 26.52.0", {configs = {target_type = get_config("target_type")}})
 add_requires("levilamina", {configs = {target_type = get_config("target_type")}})
 
 add_requires("levibuildscript")
@@ -20,7 +16,7 @@ if not has_config("vs_runtime") then
     set_runtimes("MD")
 end
 
-target("my-mod") -- Nome do mod
+target("my-mod")
     add_rules("@levibuildscript/linkrule")
     add_rules("@levibuildscript/modpacker")
     if is_plat("windows") then
@@ -49,10 +45,3 @@ target("my-mod") -- Nome do mod
     add_headerfiles("src/**.h")
     add_files("src/**.cpp")
     add_includedirs("src")
-    if is_config("target_type", "server") then
-    --  add_includedirs("src-server")
-    --  add_files("src-server/**.cpp")
-    else
-        add_includedirs("src-client")
-        add_files("src-client/**.cpp")
-    end
