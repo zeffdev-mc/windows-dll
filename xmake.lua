@@ -20,7 +20,7 @@ if not has_config("vs_runtime") then
     set_runtimes("MD")
 end
 
-target("meu-tracer") -- Nome do mod
+target("my-mod") -- Nome do mod
     add_rules("@levibuildscript/linkrule")
     add_rules("@levibuildscript/modpacker")
     if is_plat("windows") then
