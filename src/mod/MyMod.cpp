@@ -5,6 +5,7 @@
 #include <cmath>
 #include <set>
 #include <string>
+#include <unordered_map>
 
 #include "ll/api/event/EventBus.h"
 #include "ll/api/event/input/KeyInputEvent.h"
@@ -26,8 +27,10 @@ namespace my_mod {
 namespace {
 
 // ---------------------------------------------------------------------------
+// ESP simples: desenha uma caixa ao redor de cada jogador.
+//
 // Teclas em jogo:
-//   R      liga/desliga o tracer
+//   R      liga/desliga o ESP
 //   B      troca a origem da escala horizontal (aspecto da tela  <->  matriz P00)
 //   [  ]   diminui / aumenta a escala geral (5% por toque)
 //   ,  .   diminui / aumenta so a escala horizontal (5% por toque)
@@ -39,7 +42,7 @@ constexpr int kKeyScaleXDown = 188; // ,
 constexpr int kKeyScaleXUp   = 190; // .
 
 bool  gActive       = false;
-bool  gTracerOn     = false;
+bool  gEspOn        = false;
 bool  gLogNextFrame = false;
 bool  gUseP00       = false; // false: escala X = P11 / aspecto da tela
 float gScale        = 1.0f;
@@ -54,141 +57,78 @@ struct Vec3f {
 
 float dot3(Vec3f a, Vec3f b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 
-// Projeta um ponto do mundo para coordenadas da GUI. false = atras da camera.
-bool worldToScreen(ClientInstance& ci, Vec3f p, float guiW, float guiH, float& sx, float& sy) {
+// Dados da camera lidos uma vez por quadro.
+struct CamData {
+    Vec3f pos, fwd, rgt, up;
+    float kx, ky;       // fatores de escala horizontal e vertical
+    float guiW, guiH;
+};
+
+CamData readCamera(ClientInstance& ci, float guiW, float guiH) {
     auto& cam = ci.getCamera();
 
-    Vec3f pos{cam.mPosition->x, cam.mPosition->y, cam.mPosition->z};
-    Vec3f fwd{cam.mForward->x, cam.mForward->y, cam.mForward->z};
-    Vec3f rgt{cam.mRight->x, cam.mRight->y, cam.mRight->z};
-    Vec3f up{cam.mUp->x, cam.mUp->y, cam.mUp->z};
-
-    Vec3f d{p.x - pos.x, p.y - pos.y, p.z - pos.z};
-    float z = dot3(d, fwd);
-    if (z < 0.05f) {
-        return false;
-    }
-    float x = dot3(d, rgt);
-    float y = dot3(d, up);
+    CamData c;
+    c.pos = {cam.mPosition->x, cam.mPosition->y, cam.mPosition->z};
+    c.fwd = {cam.mForward->x, cam.mForward->y, cam.mForward->z};
+    c.rgt = {cam.mRight->x, cam.mRight->y, cam.mRight->z};
+    c.up  = {cam.mUp->x, cam.mUp->y, cam.mUp->z};
 
     auto  proj   = cam.getProjectionMatrix();
     float p00    = std::abs(proj[0][0]);
     float p11    = std::abs(proj[1][1]);
     float aspect = guiW / guiH;
 
-    float kx = gUseP00 ? p00 : p11 / aspect; // fator horizontal
-    float ky = p11;                          // fator vertical
+    c.kx   = gScale * gScaleX * (gUseP00 ? p00 : p11 / aspect);
+    c.ky   = gScale * p11;
+    c.guiW = guiW;
+    c.guiH = guiH;
+    return c;
+}
 
-    float ndcX = gScale * gScaleX * x * kx / z;
-    float ndcY = gScale * y * ky / z;
+// Projeta um ponto do mundo para coordenadas da GUI. false = atras da camera.
+bool project(CamData const& c, Vec3f p, float& sx, float& sy) {
+    Vec3f d{p.x - c.pos.x, p.y - c.pos.y, p.z - c.pos.z};
+    float z = dot3(d, c.fwd);
+    if (z < 0.05f) {
+        return false;
+    }
+    float x = dot3(d, c.rgt);
+    float y = dot3(d, c.up);
 
-    sx = (ndcX * 0.5f + 0.5f) * guiW;
-    sy = (0.5f - ndcY * 0.5f) * guiH;
+    float ndcX = x * c.kx / z;
+    float ndcY = y * c.ky / z;
+
+    sx = (ndcX * 0.5f + 0.5f) * c.guiW;
+    sy = (0.5f - ndcY * 0.5f) * c.guiH;
     return true;
 }
 
-// Recorta o segmento no retangulo [0,W]x[0,H] (Liang-Barsky).
-bool clipLine(float& x0, float& y0, float& x1, float& y1, float W, float H) {
-    float dx = x1 - x0;
-    float dy = y1 - y0;
-    float t0 = 0.0f;
-    float t1 = 1.0f;
-
-    auto clip = [&](float p, float q) {
-        if (std::abs(p) < 1e-9f) {
-            return q >= 0.0f;
-        }
-        float r = q / p;
-        if (p < 0.0f) {
-            if (r > t1) return false;
-            if (r > t0) t0 = r;
-        } else {
-            if (r < t0) return false;
-            if (r < t1) t1 = r;
-        }
-        return true;
-    };
-
-    if (clip(-dx, x0) && clip(dx, W - x0) && clip(-dy, y0) && clip(dy, H - y0)) {
-        float nx1 = x0 + t1 * dx;
-        float ny1 = y0 + t1 * dy;
-        float nx0 = x0 + t0 * dx;
-        float ny0 = y0 + t0 * dy;
-        x0 = nx0; y0 = ny0; x1 = nx1; y1 = ny1;
-        return true;
-    }
-    return false;
-}
-
-void fillRect(MinecraftUIRenderContext& ctx, float xa, float xb, float ya, float yb, mce::Color const& color) {
-    RectangleArea r;
-    r._x0 = xa;
-    r._x1 = xb;
-    r._y0 = ya;
-    r._y1 = yb;
-    ctx.fillRectangle(r, color, 1.0f);
-}
-
-// Linha fina de verdade: percorre o eixo maior em passos de 1 pixel fisico e junta os
-// passos que caem na mesma linha/coluna de pixels em um unico retangulo.
-// px = tamanho de 1 pixel fisico em unidades da GUI.
-void drawLine(
-    MinecraftUIRenderContext& ctx,
-    float x0, float y0, float x1, float y1,
-    float guiW, float guiH,
-    float px, float thickPx,
-    mce::Color const& color
+// Projeta os 8 cantos da caixa de colisao e devolve o retangulo que cobre todos.
+bool projectBox(
+    CamData const& c,
+    float x0, float y0, float z0,
+    float x1, float y1, float z1,
+    float& minX, float& minY, float& maxX, float& maxY
 ) {
-    if (!clipLine(x0, y0, x1, y1, guiW, guiH)) {
-        return;
-    }
+    minX = minY = 1e9f;
+    maxX = maxY = -1e9f;
 
-    float dx         = x1 - x0;
-    float dy         = y1 - y0;
-    bool  horizontal = std::abs(dx) >= std::abs(dy);
-
-    float majorLen = horizontal ? std::abs(dx) : std::abs(dy);
-    int   n        = std::clamp(static_cast<int>(std::ceil(majorLen / px)), 1, 4000);
-    float thick    = thickPx * px;
-
-    auto snap = [&](float v) { return std::floor(v / px) * px; };
-
-    float runMinor = 0.0f;
-    float runStart = 0.0f;
-    float runEnd   = 0.0f;
-
-    auto emit = [&]() {
-        float a = std::min(runStart, runEnd);
-        float b = std::max(runStart, runEnd) + px;
-        if (horizontal) {
-            fillRect(ctx, a, b, runMinor, runMinor + thick, color);
-        } else {
-            fillRect(ctx, runMinor, runMinor + thick, a, b, color);
+    for (int i = 0; i < 8; ++i) {
+        Vec3f corner{(i & 1) ? x1 : x0, (i & 2) ? y1 : y0, (i & 4) ? z1 : z0};
+        float sx = 0.0f;
+        float sy = 0.0f;
+        if (!project(c, corner, sx, sy)) {
+            return false; // algum canto atras da camera: pula este jogador
         }
-    };
-
-    for (int i = 0; i <= n; ++i) {
-        float t     = static_cast<float>(i) / static_cast<float>(n);
-        float major = horizontal ? (x0 + dx * t) : (y0 + dy * t);
-        float minor = snap(horizontal ? (y0 + dy * t) : (x0 + dx * t));
-
-        if (i == 0) {
-            runMinor = minor;
-            runStart = major;
-            runEnd   = major;
-        } else if (minor == runMinor) {
-            runEnd = major;
-        } else {
-            emit();
-            runMinor = minor;
-            runStart = major;
-            runEnd   = major;
-        }
+        minX = std::min(minX, sx);
+        maxX = std::max(maxX, sx);
+        minY = std::min(minY, sy);
+        maxY = std::max(maxY, sy);
     }
-    emit();
+    return true;
 }
 
-void drawTracers(MinecraftUIRenderContext& ctx) {
+void drawEsp(MinecraftUIRenderContext& ctx) {
     auto ciRef = ll::service::getClientInstance();
     if (!ciRef) {
         return;
@@ -207,18 +147,9 @@ void drawTracers(MinecraftUIRenderContext& ctx) {
         return;
     }
 
-    // Quantos pixels fisicos tem cada unidade da GUI.
-    float pxPerUnit = gui->mScreenSizeData->clientScreenSize->x / guiW;
-    if (pxPerUnit < 0.5f || pxPerUnit > 16.0f) {
-        pxPerUnit = 3.0f;
-    }
-    float px = 1.0f / pxPerUnit;
-
+    CamData    cam = readCamera(ci, guiW, guiH);
     Level&     level = local->getLevel();
     mce::Color red(1.0f, 0.1f, 0.1f, 1.0f);
-
-    float cx = guiW * 0.5f;
-    float cy = guiH * 0.5f;
 
     bool  log    = gLogNextFrame;
     int   found  = 0;
@@ -232,36 +163,43 @@ void drawTracers(MinecraftUIRenderContext& ctx) {
         }
         ++found;
 
-        // Tronco = centro da caixa de colisao do jogador.
         auto const& box = a->getAABB();
-        Vec3f torso{
-            (box.min.x + box.max.x) * 0.5f,
-            (box.min.y + box.max.y) * 0.5f,
-            (box.min.z + box.max.z) * 0.5f
-        };
 
-        float sx = 0.0f;
-        float sy = 0.0f;
-        bool  ok = worldToScreen(ci, torso, guiW, guiH, sx, sy);
+        float minX, minY, maxX, maxY;
+        bool  ok = projectBox(
+            cam,
+            box.min.x, box.min.y, box.min.z,
+            box.max.x, box.max.y, box.max.z,
+            minX, minY, maxX, maxY
+        );
+
         if (log) {
             if (ok) {
-                logger.info("alvo {}: tela ({:.1f},{:.1f}) de {:.0f}x{:.0f}", found, sx, sy, guiW, guiH);
+                logger.info("jogador {}: caixa ({:.1f},{:.1f}) - ({:.1f},{:.1f}) de {:.0f}x{:.0f}", found, minX, minY, maxX, maxY, guiW, guiH);
             } else {
-                logger.info("alvo {}: atras da camera", found);
+                logger.info("jogador {}: atras da camera", found);
             }
         }
-        if (ok) {
-            drawLine(ctx, cx, cy, sx, sy, guiW, guiH, px, 2.0f, red);
+        if (!ok) {
+            continue;
         }
+        if (maxX < 0.0f || minX > guiW || maxY < 0.0f || minY > guiH) {
+            continue; // fora da tela
+        }
+
+        RectangleArea r;
+        r._x0 = minX;
+        r._x1 = maxX;
+        r._y0 = minY;
+        r._y1 = maxY;
+        ctx.drawRectangle(r, red, 1.0f, 1);
     }
 
     if (log) {
-        auto  proj = ci.getCamera().getProjectionMatrix();
-        float p00  = proj[0][0];
-        float p11  = proj[1][1];
+        auto proj = ci.getCamera().getProjectionMatrix();
         logger.info(
-            "diagnostico: jogadores={} P00={:.3f} P11={:.3f} P11/P00={:.3f} aspecto_tela={:.3f} usaP00={} escala={:.2f} escalaX={:.2f} px/unidade={:.2f}",
-            found, p00, p11, p00 != 0.0f ? p11 / p00 : 0.0f, guiW / guiH, gUseP00, gScale, gScaleX, pxPerUnit
+            "diagnostico: jogadores={} P00={:.3f} P11={:.3f} aspecto_tela={:.3f} usaP00={} escala={:.2f} escalaX={:.2f}",
+            found, proj[0][0], proj[1][1], guiW / guiH, gUseP00, gScale, gScaleX
         );
         gLogNextFrame = false;
     }
@@ -275,12 +213,12 @@ MyMod& MyMod::getInstance() {
 }
 
 bool MyMod::load() {
-    getSelf().getLogger().info("Meu Tracer: load");
+    getSelf().getLogger().info("Meu ESP: load");
     return true;
 }
 
 bool MyMod::enable() {
-    getSelf().getLogger().info("Meu Tracer: enable - R liga/desliga; B, [ ] , . calibram");
+    getSelf().getLogger().info("Meu ESP: enable - R liga/desliga; B, [ ] , . calibram");
     gActive = true;
 
     auto& bus = ll::event::EventBus::getInstance();
@@ -304,9 +242,9 @@ bool MyMod::enable() {
         auto& logger = getSelf().getLogger();
         switch (code) {
         case 'R':
-            gTracerOn     = !gTracerOn;
-            gLogNextFrame = gTracerOn;
-            logger.info("Tracer {}", gTracerOn ? "LIGADO" : "DESLIGADO");
+            gEspOn        = !gEspOn;
+            gLogNextFrame = gEspOn;
+            logger.info("ESP {}", gEspOn ? "LIGADO" : "DESLIGADO");
             break;
         case 'B':
             gUseP00       = !gUseP00;
@@ -339,20 +277,34 @@ bool MyMod::enable() {
     });
 
     bus.emplaceListener<ll::event::AfterUIRenderEvent>([this](ll::event::AfterUIRenderEvent& event) {
-        if (!gActive || !gTracerOn) {
+        if (!gActive || !gEspOn) {
             return;
         }
 
         // O evento dispara uma vez por tela. Desenhamos so na tela do HUD.
-        std::string name = event.screenView().getScreenName();
+        // O nome de cada tela so e lido uma vez (guardado por ponteiro) para nao pesar.
+        static std::unordered_map<void const*, bool> hudCache;
+        ScreenView& sv = event.screenView();
 
-        static std::set<std::string> seen;
-        if (seen.size() < 12 && seen.insert(name).second) {
-            getSelf().getLogger().info("tela de UI vista: {}", name);
+        bool isHud;
+        auto it = hudCache.find(&sv);
+        if (it != hudCache.end()) {
+            isHud = it->second;
+        } else {
+            std::string name = sv.getScreenName();
+            isHud            = name.find("hud") != std::string::npos;
+            if (hudCache.size() > 64) {
+                hudCache.clear();
+            }
+            hudCache[&sv] = isHud;
+
+            static std::set<std::string> seen;
+            if (seen.size() < 12 && seen.insert(name).second) {
+                getSelf().getLogger().info("tela de UI vista: {}", name);
+            }
         }
 
-        bool isHud = name.find("hud") != std::string::npos;
-        bool draw  = false;
+        bool draw = false;
         if (isHud) {
             gSeenHud = true;
         }
@@ -368,7 +320,7 @@ bool MyMod::enable() {
         }
 
         if (draw) {
-            drawTracers(event.uiRenderContext());
+            drawEsp(event.uiRenderContext());
         }
     });
 
@@ -376,9 +328,9 @@ bool MyMod::enable() {
 }
 
 bool MyMod::disable() {
-    getSelf().getLogger().info("Meu Tracer: disable");
-    gActive   = false;
-    gTracerOn = false;
+    getSelf().getLogger().info("Meu ESP: disable");
+    gActive = false;
+    gEspOn  = false;
     return true;
 }
 
