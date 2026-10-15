@@ -6,6 +6,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "ll/api/event/EventBus.h"
 #include "ll/api/event/input/KeyInputEvent.h"
@@ -16,6 +17,8 @@
 #include "mc/client/game/ClientInstance.h"
 #include "mc/client/gui/GuiData.h"
 #include "mc/client/player/LocalPlayer.h"
+#include "mc/client/renderer/game/LevelRenderer.h"
+#include "mc/client/renderer/game/LevelRendererPlayer.h"
 #include "mc/deps/core/math/Color.h"
 #include "mc/deps/input/RectangleArea.h"
 #include "mc/deps/renderer/Camera.h"
@@ -27,29 +30,31 @@ namespace my_mod {
 namespace {
 
 // ---------------------------------------------------------------------------
-// ESP simples: desenha uma caixa ao redor de cada jogador.
+// ESP 3D: caixa em arame (12 arestas) ao redor de cada jogador, em ciano claro.
 //
 // Teclas em jogo:
 //   R      liga/desliga o ESP
-//   B      troca a origem da escala horizontal (aspecto da tela  <->  matriz P00)
+//   N      alterna entre caixa 3D (arame) e caixa 2D simples
+//   B      troca a fonte do FOV: FOV real do jogo  <->  FOV da matriz da camera
 //   [  ]   diminui / aumenta a escala geral (5% por toque)
-//   ,  .   diminui / aumenta so a escala horizontal (5% por toque)
+// O log do LeviLamina mostra, ao ligar e a cada ajuste, os valores usados.
 // ---------------------------------------------------------------------------
 
-constexpr int kKeyScaleDown  = 219; // [
-constexpr int kKeyScaleUp    = 221; // ]
-constexpr int kKeyScaleXDown = 188; // ,
-constexpr int kKeyScaleXUp   = 190; // .
+constexpr int kKeyScaleDown = 219; // [
+constexpr int kKeyScaleUp   = 221; // ]
 
 bool  gActive       = false;
 bool  gEspOn        = false;
 bool  gLogNextFrame = false;
-bool  gUseP00       = false; // false: escala X = P11 / aspecto da tela
+bool  gMode3D       = true;
+bool  gUseGameFov   = true;
 float gScale        = 1.0f;
-float gScaleX       = 1.0f;
 bool  gSeenHud      = false;
 int   gPassesNoHud  = 0;
 std::chrono::steady_clock::time_point gLastDraw{};
+
+constexpr int   kRectBudget = 600;   // maximo de retangulos por quadro (evita lag)
+constexpr float kDot        = 1.0f;  // tamanho de cada ponto em unidades da GUI
 
 struct Vec3f {
     float x, y, z;
@@ -60,11 +65,28 @@ float dot3(Vec3f a, Vec3f b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 // Dados da camera lidos uma vez por quadro.
 struct CamData {
     Vec3f pos, fwd, rgt, up;
-    float kx, ky;       // fatores de escala horizontal e vertical
-    float guiW, guiH;
+    float kx, ky; // fatores de escala horizontal e vertical
+    float W, H;   // tamanho do espaco de desenho da UI
 };
 
-CamData readCamera(ClientInstance& ci, float guiW, float guiH) {
+// FOV vertical real que o jogo usa no mundo (em graus). 0 = indisponivel.
+float gameFovDegrees(ClientInstance& ci) {
+    LevelRenderer* lr = ci.getLevelRenderer();
+    if (!lr) {
+        return 0.0f;
+    }
+    LevelRendererPlayer* lrp = ci.getLevelRendererPlayer();
+    if (!lrp) {
+        return 0.0f;
+    }
+    float f = lrp->getFov(1.0f, true);
+    if (f > 0.0f && f < 3.2f) {
+        f = f * 180.0f / 3.14159265f; // veio em radianos
+    }
+    return (f > 5.0f && f < 175.0f) ? f : 0.0f;
+}
+
+CamData readCamera(ClientInstance& ci, float W, float H) {
     auto& cam = ci.getCamera();
 
     CamData c;
@@ -73,19 +95,25 @@ CamData readCamera(ClientInstance& ci, float guiW, float guiH) {
     c.rgt = {cam.mRight->x, cam.mRight->y, cam.mRight->z};
     c.up  = {cam.mUp->x, cam.mUp->y, cam.mUp->z};
 
-    auto  proj   = cam.getProjectionMatrix();
-    float p00    = std::abs(proj[0][0]);
-    float p11    = std::abs(proj[1][1]);
-    float aspect = guiW / guiH;
+    float aspect = W / H;
+    float p11    = std::abs(cam.getProjectionMatrix()[1][1]);
+    float ky     = p11; // fator vertical vindo da matriz da camera
 
-    c.kx   = gScale * gScaleX * (gUseP00 ? p00 : p11 / aspect);
-    c.ky   = gScale * p11;
-    c.guiW = guiW;
-    c.guiH = guiH;
+    if (gUseGameFov) {
+        float fov = gameFovDegrees(ci);
+        if (fov > 0.0f) {
+            ky = 1.0f / std::tan(fov * 3.14159265f / 180.0f * 0.5f);
+        }
+    }
+
+    c.ky = gScale * ky;
+    c.kx = gScale * ky / aspect;
+    c.W  = W;
+    c.H  = H;
     return c;
 }
 
-// Projeta um ponto do mundo para coordenadas da GUI. false = atras da camera.
+// Projeta um ponto do mundo para coordenadas da UI. false = atras da camera.
 bool project(CamData const& c, Vec3f p, float& sx, float& sy) {
     Vec3f d{p.x - c.pos.x, p.y - c.pos.y, p.z - c.pos.z};
     float z = dot3(d, c.fwd);
@@ -95,40 +123,51 @@ bool project(CamData const& c, Vec3f p, float& sx, float& sy) {
     float x = dot3(d, c.rgt);
     float y = dot3(d, c.up);
 
-    float ndcX = x * c.kx / z;
-    float ndcY = y * c.ky / z;
-
-    sx = (ndcX * 0.5f + 0.5f) * c.guiW;
-    sy = (0.5f - ndcY * 0.5f) * c.guiH;
+    sx = (x * c.kx / z * 0.5f + 0.5f) * c.W;
+    sy = (0.5f - y * c.ky / z * 0.5f) * c.H;
     return true;
 }
 
-// Projeta os 8 cantos da caixa de colisao e devolve o retangulo que cobre todos.
-bool projectBox(
-    CamData const& c,
-    float x0, float y0, float z0,
-    float x1, float y1, float z1,
-    float& minX, float& minY, float& maxX, float& maxY
+void fillRect(MinecraftUIRenderContext& ctx, float xa, float xb, float ya, float yb, mce::Color const& color) {
+    RectangleArea r;
+    r._x0 = xa;
+    r._x1 = xb;
+    r._y0 = ya;
+    r._y1 = yb;
+    ctx.fillRectangle(r, color, 1.0f);
+}
+
+// Aresta feita de pontos; maxDots limita o custo (aresta longa fica pontilhada em vez de pesada).
+void drawEdge(
+    MinecraftUIRenderContext& ctx,
+    float ax, float ay, float bx, float by,
+    int maxDots, float W, float H,
+    mce::Color const& color
 ) {
-    minX = minY = 1e9f;
-    maxX = maxY = -1e9f;
+    float dx  = bx - ax;
+    float dy  = by - ay;
+    float len = std::sqrt(dx * dx + dy * dy);
+    int   n   = std::clamp(static_cast<int>(std::ceil(len / kDot)), 1, std::max(1, maxDots));
+    float h   = kDot * 0.5f;
 
-    for (int i = 0; i < 8; ++i) {
-        Vec3f corner{(i & 1) ? x1 : x0, (i & 2) ? y1 : y0, (i & 4) ? z1 : z0};
-        float sx = 0.0f;
-        float sy = 0.0f;
-        if (!project(c, corner, sx, sy)) {
-            return false; // algum canto atras da camera: pula este jogador
+    for (int i = 0; i <= n; ++i) {
+        float t = static_cast<float>(i) / static_cast<float>(n);
+        float x = ax + dx * t;
+        float y = ay + dy * t;
+        if (x < -1.0f || x > W + 1.0f || y < -1.0f || y > H + 1.0f) {
+            continue;
         }
-        minX = std::min(minX, sx);
-        maxX = std::max(maxX, sx);
-        minY = std::min(minY, sy);
-        maxY = std::max(maxY, sy);
+        fillRect(ctx, x - h, x + h, y - h, y + h, color);
     }
-    return true;
 }
 
-void drawEsp(MinecraftUIRenderContext& ctx) {
+struct Box {
+    float sx[8];
+    float sy[8];
+    float minX, minY, maxX, maxY;
+};
+
+void drawEsp(MinecraftUIRenderContext& ctx, ScreenView& sv) {
     auto ciRef = ll::service::getClientInstance();
     if (!ciRef) {
         return;
@@ -140,22 +179,32 @@ void drawEsp(MinecraftUIRenderContext& ctx) {
         return;
     }
 
-    auto  gui  = ci.getGuiData();
-    float guiW = gui->mScreenSizeData->clientUIScreenSize->x;
-    float guiH = gui->mScreenSizeData->clientUIScreenSize->y;
-    if (guiW <= 0.0f || guiH <= 0.0f) {
+    // Espaco de desenho real desta tela da UI.
+    float W = sv.mSize->x;
+    float H = sv.mSize->y;
+    auto  gui = ci.getGuiData();
+    float uiW = gui->mScreenSizeData->clientUIScreenSize->x;
+    float uiH = gui->mScreenSizeData->clientUIScreenSize->y;
+    if (W <= 1.0f || H <= 1.0f) {
+        W = uiW;
+        H = uiH;
+    }
+    if (W <= 1.0f || H <= 1.0f) {
         return;
     }
 
-    CamData    cam = readCamera(ci, guiW, guiH);
+    CamData    cam   = readCamera(ci, W, H);
     Level&     level = local->getLevel();
-    mce::Color red(1.0f, 0.1f, 0.1f, 1.0f);
+    mce::Color cyan(0.55f, 1.0f, 1.0f, 1.0f);
 
     bool  log    = gLogNextFrame;
-    int   found  = 0;
     auto& logger = MyMod::getInstance().getSelf().getLogger();
 
     Actor* localActor = static_cast<Actor*>(local);
+
+    // 1) projeta a caixa de todos os jogadores
+    std::vector<Box> boxes;
+    int              found = 0;
 
     for (Actor* a : level.getRuntimeActorList()) {
         if (!a || a == localActor || !a->isPlayer() || !a->isAlive()) {
@@ -163,44 +212,76 @@ void drawEsp(MinecraftUIRenderContext& ctx) {
         }
         ++found;
 
-        auto const& box = a->getAABB();
+        auto const& bb = a->getAABB();
+        Box         box;
+        box.minX = box.minY = 1e9f;
+        box.maxX = box.maxY = -1e9f;
 
-        float minX, minY, maxX, maxY;
-        bool  ok = projectBox(
-            cam,
-            box.min.x, box.min.y, box.min.z,
-            box.max.x, box.max.y, box.max.z,
-            minX, minY, maxX, maxY
-        );
+        bool ok = true;
+        for (int i = 0; i < 8; ++i) {
+            Vec3f corner{
+                (i & 1) ? bb.max.x : bb.min.x,
+                (i & 2) ? bb.max.y : bb.min.y,
+                (i & 4) ? bb.max.z : bb.min.z
+            };
+            if (!project(cam, corner, box.sx[i], box.sy[i])) {
+                ok = false; // algum canto atras da camera: pula este jogador
+                break;
+            }
+            box.minX = std::min(box.minX, box.sx[i]);
+            box.maxX = std::max(box.maxX, box.sx[i]);
+            box.minY = std::min(box.minY, box.sy[i]);
+            box.maxY = std::max(box.maxY, box.sy[i]);
+        }
 
         if (log) {
             if (ok) {
-                logger.info("jogador {}: caixa ({:.1f},{:.1f}) - ({:.1f},{:.1f}) de {:.0f}x{:.0f}", found, minX, minY, maxX, maxY, guiW, guiH);
+                logger.info("jogador {}: caixa ({:.1f},{:.1f}) - ({:.1f},{:.1f}) em {:.0f}x{:.0f}", found, box.minX, box.minY, box.maxX, box.maxY, W, H);
             } else {
                 logger.info("jogador {}: atras da camera", found);
             }
         }
-        if (!ok) {
+        if (!ok || box.maxX < 0.0f || box.minX > W || box.maxY < 0.0f || box.minY > H) {
             continue;
         }
-        if (maxX < 0.0f || minX > guiW || maxY < 0.0f || minY > guiH) {
-            continue; // fora da tela
-        }
+        boxes.push_back(box);
+    }
 
-        RectangleArea r;
-        r._x0 = minX;
-        r._x1 = maxX;
-        r._y0 = minY;
-        r._y1 = maxY;
-        ctx.drawRectangle(r, red, 1.0f, 1);
+    // 2) desenha
+    int perEdge = 40;
+    if (!boxes.empty()) {
+        perEdge = std::clamp(kRectBudget / (12 * static_cast<int>(boxes.size())), 3, 60);
+    }
+
+    for (Box const& b : boxes) {
+        if (gMode3D) {
+            for (int i = 0; i < 8; ++i) {
+                for (int bit : {1, 2, 4}) {
+                    if (i & bit) {
+                        continue;
+                    }
+                    int j = i | bit;
+                    drawEdge(ctx, b.sx[i], b.sy[i], b.sx[j], b.sy[j], perEdge, W, H, cyan);
+                }
+            }
+        } else {
+            drawEdge(ctx, b.minX, b.minY, b.maxX, b.minY, 60, W, H, cyan);
+            drawEdge(ctx, b.minX, b.maxY, b.maxX, b.maxY, 60, W, H, cyan);
+            drawEdge(ctx, b.minX, b.minY, b.minX, b.maxY, 60, W, H, cyan);
+            drawEdge(ctx, b.maxX, b.minY, b.maxX, b.maxY, 60, W, H, cyan);
+        }
     }
 
     if (log) {
-        auto proj = ci.getCamera().getProjectionMatrix();
+        auto  proj    = ci.getCamera().getProjectionMatrix();
+        float p11     = std::abs(proj[1][1]);
+        float fovMat  = p11 > 1e-4f ? 2.0f * std::atan(1.0f / p11) * 180.0f / 3.14159265f : 0.0f;
+        float fovGame = gameFovDegrees(ci);
         logger.info(
-            "diagnostico: jogadores={} P00={:.3f} P11={:.3f} aspecto_tela={:.3f} usaP00={} escala={:.2f} escalaX={:.2f}",
-            found, proj[0][0], proj[1][1], guiW / guiH, gUseP00, gScale, gScaleX
+            "diagnostico: jogadores={} modo={} fonteFOV={} fovJogo={:.1f} fovMatriz={:.1f} P00={:.3f} P11={:.3f} escala={:.2f}",
+            found, gMode3D ? "3D" : "2D", gUseGameFov ? "jogo" : "matriz", fovGame, fovMat, proj[0][0], proj[1][1], gScale
         );
+        logger.info("espaco da UI: ScreenView {:.0f}x{:.0f} / clientUI {:.0f}x{:.0f}", W, H, uiW, uiH);
         gLogNextFrame = false;
     }
 }
@@ -218,7 +299,7 @@ bool MyMod::load() {
 }
 
 bool MyMod::enable() {
-    getSelf().getLogger().info("Meu ESP: enable - R liga/desliga; B, [ ] , . calibram");
+    getSelf().getLogger().info("Meu ESP: enable - R liga/desliga; N 2D/3D; B fonte do FOV; [ ] escala");
     gActive = true;
 
     auto& bus = ll::event::EventBus::getInstance();
@@ -246,10 +327,15 @@ bool MyMod::enable() {
             gLogNextFrame = gEspOn;
             logger.info("ESP {}", gEspOn ? "LIGADO" : "DESLIGADO");
             break;
-        case 'B':
-            gUseP00       = !gUseP00;
+        case 'N':
+            gMode3D       = !gMode3D;
             gLogNextFrame = true;
-            logger.info("Escala horizontal vem de: {}", gUseP00 ? "P00 (matriz)" : "P11 / aspecto da tela");
+            logger.info("Caixa {}", gMode3D ? "3D (arame)" : "2D simples");
+            break;
+        case 'B':
+            gUseGameFov   = !gUseGameFov;
+            gLogNextFrame = true;
+            logger.info("FOV vem de: {}", gUseGameFov ? "jogo" : "matriz da camera");
             break;
         case kKeyScaleDown:
             gScale        = std::max(0.2f, gScale * 0.95f);
@@ -260,16 +346,6 @@ bool MyMod::enable() {
             gScale        = std::min(5.0f, gScale * 1.05f);
             gLogNextFrame = true;
             logger.info("Escala geral = {:.3f}", gScale);
-            break;
-        case kKeyScaleXDown:
-            gScaleX       = std::max(0.2f, gScaleX * 0.95f);
-            gLogNextFrame = true;
-            logger.info("Escala horizontal = {:.3f}", gScaleX);
-            break;
-        case kKeyScaleXUp:
-            gScaleX       = std::min(5.0f, gScaleX * 1.05f);
-            gLogNextFrame = true;
-            logger.info("Escala horizontal = {:.3f}", gScaleX);
             break;
         default:
             break;
@@ -320,7 +396,7 @@ bool MyMod::enable() {
         }
 
         if (draw) {
-            drawEsp(event.uiRenderContext());
+            drawEsp(event.uiRenderContext(), sv);
         }
     });
 
