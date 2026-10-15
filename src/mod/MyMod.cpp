@@ -75,7 +75,11 @@ float gameFovDegrees(ClientInstance& ci) {
     if (!lr) {
         return 0.0f;
     }
+<<<<<<< HEAD
     LevelRendererPlayer* lrp = ci.getLevelRendererPlayer();
+=======
+    LevelRendererPlayer* lrp = lr->mLevelRendererPlayer->get();
+>>>>>>> 5e3e0c1abbc51523aad689a463363b325441be8d
     if (!lrp) {
         return 0.0f;
     }
